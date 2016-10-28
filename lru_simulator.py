@@ -3,12 +3,14 @@ from __future__ import division
 import sys
 import re
 from sets import Set
+from Queue import Queue
 
 KB=1000
 MB=1000*KB
-level1_speed=1.0
-level2_speed=10.0
-TOTAL_SIZE=0
+level1_speed=1000.0*MB
+speed_diff=6.0
+level2_speed=speed_diff*level1_speed
+factor=1.0-(1.0/10.0)
 
 class Node:
 	def __init__(self,key):
@@ -27,6 +29,7 @@ class DoubleLinkedList:
 	def removeLast(self):
 		node=self.tail
 		ret=node.dirty
+		#print "key %d"%(node.key)
 		del self.keys[node.key]
 		self.remove(node)
 		return ret
@@ -51,7 +54,9 @@ class DoubleLinkedList:
 		self.remove(node)
 		self.addFirst(node)
 		if 'w' == mode:
+			#print "key %d dirty"%(key)
 			node.dirty=True	
+		return node
 
 	def addFirst(self,node):
 		if not self.head:
@@ -63,10 +68,13 @@ class DoubleLinkedList:
 		self.head=node
 		node.prev=None
 
-	def insert(self, key):
+	def insert(self, key, mode):
 		node=Node(key)
 		self.addFirst(node)
 		self.keys[key]=node
+		if 'w' == mode:
+			node.dirty=True
+		return node
 	
 	def has(self, key):
 		return key in self.keys
@@ -80,12 +88,17 @@ class buffer:
 	total_IO=0
 	cache_list={}
 	lru_queue=DoubleLinkedList()
+	write_back_queue=Queue()
 	file_hash={}
 	current_file_number=0
 	current_page_number=0
 	import_size=0
-	read_size=0
+	level1_size=0
 	total_IO_size=0
+	previous_sec=0
+	previous_usec=0
+	previous_remain=0
+	write_back_size=0
 
 	def __init__(self, buffer_size):
 		self.buffer_size=buffer_size
@@ -93,8 +106,17 @@ class buffer:
 		self.swap_out_count=0
 		self.total_IO=0
 		self.import_size=0
-		self.read_size=0
 		self.total_IO_size=0
+
+	def get_time_diff(self, time_sec, time_usec):
+		if 0 == self.previous_sec:
+			self.previous_sec=time_sec
+			self.previous_usec=time_usec
+		diff=time_sec-self.previous_sec
+		diff+=(time_usec-self.previous_usec)*0.001*0.001
+		self.previous_sec=time_sec
+		self.previous_usec=time_usec
+		return diff
 
 	#return file number
 	def __get_file_number__(self, file_name):
@@ -105,8 +127,36 @@ class buffer:
 			self.current_file_number+=1
 			return self.file_hash[file_name]
 
-	def require_buffer(self, file_name, start_point, size, mode):
+	def update_write_back_size(self, time_diff):
+		#the size can be written back during the time diff	
+		written_back_size=time_diff*level1_speed+self.previous_remain
+
+		while self.page_size <= written_back_size:
+			if not self.write_back_queue.empty():
+				#print "write back %d"%(written_back_size)
+				node=self.write_back_queue.get()
+				node.dirty=False
+				written_back_size-=self.page_size
+			else:
+				break
+		if not self.write_back_queue.empty():
+			#print "cannot write back %d"%(written_back_size)
+			self.previous_remain=max(0, written_back_size)
+		else:
+			self.previous_remain=0
+
+	def require_buffer(self, file_name,\
+			tv_sec, tv_usec,\
+			duration,\
+			start_point, size, mode):
 		file_number=self.__get_file_number__(file_name)
+
+		time_diff=self.get_time_diff(tv_sec, tv_usec)-duration*factor
+		if 0.0 > time_diff:
+			time_diff=0.0
+
+		#print "time diff %f"%(time_diff)
+		self.update_write_back_size(time_diff)
 
 		tmp_start_point=start_point
 
@@ -142,7 +192,9 @@ class buffer:
 			size-=IO_size
 
 	def __update_page__(self, page_number, mode):
-		self.lru_queue.touch(page_number, mode)
+		node=self.lru_queue.touch(page_number, mode)
+		if 'w' == mode:
+			self.write_back_queue.put(node)
 
 	#return page number
 	def __allocate_page__(self, file_number, tmp_start_point, size, mode):
@@ -159,22 +211,28 @@ class buffer:
 		#print "available_size %d"%self.available_size
 		if self.available_size >= self.page_size:
 			#print "create new cache"
+			#print "available_size %d"%(self.available_size)
 			self.available_size-=self.page_size
 			if 'r' == mode:
 				self.cache_miss+=1
 		else:
 			#print "swap out"
 			self.__swap_out__(1)
+		node=self.lru_queue.insert(page_number, mode)
 
 		if 'r' == mode:
-			self.read_size+=self.page_size
-                self.lru_queue.insert(page_number)
+			self.level1_size+=self.page_size
+		else:
+			self.write_back_queue.put(node)
 
 	def __swap_out__(self, number):
             while 0 < number:
 		if self.lru_queue.removeLast():
 			#sychronized
-			self.read_size+=self.page_size
+			#write back page
+			#print "buffer overflow"
+			self.write_back_size+=self.page_size
+			self.level1_size+=self.page_size
 		self.swap_out_count+=1
 		self.cache_miss+=1
                 number-=1
@@ -183,13 +241,13 @@ class buffer:
 	#the value is cache_miss - clear pages
 	#cache miss doesn't include write to new page
 	def __level1_size__(self):
-		return self.read_size
+		return self.level1_size
 
 	#the total size can be served by buffer
 	#the value is total IO size - cache_miss
 	#cache miss doesn't include write to new page
 	def __level2_size__(self):
-		return self.total_IO_size - self.read_size
+		return self.total_IO_size - self.__level1_size__()
 	
 	#the speed actual can achieve with given buffer size
 	def buffered_speed(self):
@@ -210,9 +268,10 @@ class buffer:
 		return float(total_size)/total_time
 
 	def print_intermediate_result(self):
-		sys.stdout.write("\rswap out %d, cache miss %d, total_IO %d import size %d, read size %d, total_size %d"%\
+		#sys.stdout.write("\rswap out %d, cache miss %d, total_IO %d import size %d, level1 size %d, total_size %d"%\
+		print ("swap out %d, cache miss %d, total_IO %d import size %d, level1 size %d, total_size %d"%\
                         (self.swap_out_count, self.cache_miss, self.total_IO,\
-                        self.import_size, self.read_size, self.total_IO_size))
+                        self.import_size, self.level1_size, self.total_IO_size))
 	
 	def print_final_result(self):
 		#a new line
@@ -223,6 +282,7 @@ class buffer:
 			(self.buffer_size/float(MB), \
 			self.page_size/float(MB))
 
+		self.print_intermediate_result()
 		self.print_ratio()
 
 
@@ -232,33 +292,35 @@ class buffer:
                 #        (self.swap_out_count, self.cache_miss, self.total_IO)
 
 				
-re_pattern=re.compile(r"^.+\s+(?P<time>\d+\.\d+)\s+\d+\s+(?P<type>\w)\s+(?P<path>.+)\s+(?P<offset>\d+)\s+(?P<size>\d+)\s*$")
+re_pattern=re.compile(r"^(?P<time_sec>\d+)\.(?P<time_usec>\d+)\s+(?P<duration>\d+\.\d+)\s+\d+\s+(?P<type>\w)\s+(?P<path>.+)\s+(?P<offset>\d+)\s+(?P<size>\d+)\s*$")
 
 def get_value(line, buffer):
 	ret=re_pattern.match(line)
 	time=0.0
-	global TOTAL_SIZE
-
 	if ret:
 		re_dict=ret.groupdict()
 		type=re_dict["type"]
-		time+=float(re_dict["time"])
+		time+=float(re_dict["duration"])
 		file_name=re_dict["path"]
 		if (type=="r") or (type == "w"):
 
-			TOTAL_SIZE+=int(re_dict["size"])
-			if "r" == type:
+			if 'r' == type:
 				#print 'read'
 				#print file_name
 				buffer.require_buffer(file_name, \
+					int(re_dict["time_sec"]),\
+					int(re_dict["time_usec"]),\
+					float(re_dict["duration"]),\
                                         int(re_dict["offset"]), \
                                         int(re_dict["size"]),\
 					"r")
-
-			elif "w" == type:
+			elif 'w' == type:
 				#print 'write'
 				#print file_name
 				buffer.require_buffer(file_name, \
+					int(re_dict["time_sec"]),\
+					int(re_dict["time_usec"]),\
+					float(re_dict["duration"]),\
                                         int(re_dict["offset"]),\
                                         int(re_dict["size"]),\
 					"w")
