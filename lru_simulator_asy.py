@@ -179,7 +179,7 @@ class buffer:
 
 		#print "time diff %f"%(time_diff)
 		#Asychronized
-		#self.update_write_back_size(time_diff)
+		self.update_write_back_size(time_diff)
 		#end
 
 		tmp_start_point=start_point
@@ -236,8 +236,8 @@ class buffer:
 		else:
 			self.re_read_size+=size
 		#Asychronized
-		#if 'w' == mode:
-		#	self.write_back_queue.put(node)
+		if 'w' == mode:
+			self.write_back_queue.put(node)
 		#end
 
 	#return page number
@@ -269,8 +269,8 @@ class buffer:
 		if 'r' == mode:
 			self.level1_size+=self.page_size
 		#Asychronized
-		#else:
-		#	self.write_back_queue.put(node)
+		else:
+			self.write_back_queue.put(node)
 		#end
 
 	def __swap_out__(self, number):

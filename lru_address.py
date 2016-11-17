@@ -12,6 +12,9 @@ speed_diff=6.0
 level2_speed=speed_diff*level1_speed
 factor=1.0-(1.0/10.0)
 
+def print_address(address, size, mode):
+	print address, size, mode
+
 class Node:
 	def __init__(self,key):
 		self.key=key
@@ -94,6 +97,7 @@ class buffer:
 	lru_queue=DoubleLinkedList()
 	write_back_queue=Queue()
 	file_hash={}
+	file_size_suffix={}
 
 	current_file_number=0	#the file number counter, used to assign
 				#file number
@@ -140,14 +144,34 @@ class buffer:
 		self.previous_usec=time_usec
 		return diff
 
+	def update_file_size_suffix(self):
+		total_size=0
+		for (file_number, file_size) in self.file_size_suffix.items():
+			tmp_size=total_size+file_size
+			file_size=total_size
+			total_size=tmp_size
+
+	def set_max_size(self, file_path, max_size):
+		if not file_path in self.file_hash:
+			self.file_hash[file_path]=self.current_file_number
+			self.file_size_suffix[self.current_file_number]=max_size
+			self.current_file_number+=1
+		else:
+			file_number=self.file_hash[file_path]
+			origin_size=self.file_size_suffix[file_number]
+			self.file_size_suffix[file_number]=\
+			max(max_size, origin_size)
+
 	#return file number
 	def __get_file_number__(self, file_name):
 		if file_name in self.file_hash:
 			return self.file_hash[file_name]
 		else:
-			self.file_hash[file_name]=self.current_file_number
+			number=self.current_file_number
+			self.file_hash[file_name]=number
+			self.file_size_suffix[number]=0
 			self.current_file_number+=1
-			return self.file_hash[file_name]
+			return number
 
 	def update_write_back_size(self, time_diff):
 		#the size can be written back during the time diff	
@@ -179,14 +203,8 @@ class buffer:
 
 		#print "time diff %f"%(time_diff)
 		#Asychronized
-		#self.update_write_back_size(time_diff)
+		self.update_write_back_size(time_diff)
 		#end
-
-		tmp_start_point=start_point
-
-		if 0 != tmp_start_point%self.page_size:
-			tmp_start_point=int(tmp_start_point/self.page_size)*\
-                                self.page_size
 
 		self.total_IO_size+=size
 		
@@ -194,6 +212,13 @@ class buffer:
 			self.write_size+=size
 		else:
 			self.read_size+=size
+
+		tmp_start_point=start_point
+
+		if 0 != tmp_start_point%self.page_size:
+			tmp_start_point=int(tmp_start_point/self.page_size)*\
+                                self.page_size
+			size+=tmp_start_point-start_point
 
 		#split IO size into mulitple pages
 		while 0 < size:
@@ -217,9 +242,16 @@ class buffer:
 			if self.lru_queue.has(page_number):
 				#print "buffered in lru"
 				self.__update_page__(page_number, mode, size)
+				print_address(self.get_file_address(file_number,\
+						start_point),\
+						size, 'b')
+						
 			else:
 				#print "not buffered in lru"
 				self.__insert_page__(page_number, size, mode)
+				print_address(self.get_file_address(file_number,\
+						start_point),\
+						size, 'u')
 				if 'r' == mode:
 					self.swapin_read_size+=size
 
@@ -228,6 +260,12 @@ class buffer:
 			#first allocate the page number then insert
 			page_number=self.__allocate_page__(file_number,\
                                    start_point, size, mode)
+			print_address(self.get_file_address(file_number,\
+					start_point),\
+					size, 'u')
+
+	def get_file_address(self, file_number, start_point):
+		return self.file_size_suffix[file_number]+start_point
 
 	def __update_page__(self, page_number, mode, size):
 		node, ret=self.lru_queue.touch(page_number, mode)
@@ -236,8 +274,8 @@ class buffer:
 		else:
 			self.re_read_size+=size
 		#Asychronized
-		#if 'w' == mode:
-		#	self.write_back_queue.put(node)
+		if 'w' == mode:
+			self.write_back_queue.put(node)
 		#end
 
 	#return page number
@@ -269,8 +307,8 @@ class buffer:
 		if 'r' == mode:
 			self.level1_size+=self.page_size
 		#Asychronized
-		#else:
-		#	self.write_back_queue.put(node)
+		else:
+			self.write_back_queue.put(node)
 		#end
 
 	def __swap_out__(self, number):
@@ -309,7 +347,7 @@ class buffer:
 	#the theoretical max speed
 	def max_speed(self):
 		level1_time=self.import_size/level1_speed
-		level2_time=(self.total_IO_size)/level2_speed
+		level2_time=(self.total_IO_size-self.import_size)/level2_speed
 		total_time=level1_time+level2_time
 		total_size=self.total_IO_size
 
@@ -350,6 +388,14 @@ class buffer:
 				
 re_pattern=re.compile(r"^(?P<time_sec>\d+)\.(?P<time_usec>\d+)\s+(?P<duration>\d+\.\d+)\s+\d+\s+(?P<type>\w)\s+(?P<path>.+)\s+(?P<offset>\d+)\s+(?P<size>\d+)\s*$")
 
+def get_max_size(line, buffer):
+	ret=re_pattern.match(line)
+	if ret:
+		ret_dic=ret.groupdict()
+		file_path=ret_dic['path']
+		max_size=int(ret_dic['offset'])+int(ret_dic['size'])
+		buffer.set_max_size(file_path, max_size)
+
 def get_value(line, buffer):
 	ret=re_pattern.match(line)
 	time=0.0
@@ -387,6 +433,10 @@ def main(file, cache_size):
 	cache_obj=buffer(int(cache_size)*KB)
 	fd=open(file, 'r')
 	time=0.0
+	for line in fd:
+		get_max_size(line, cache_obj)
+	fd.seek(0, 0)
+
 	for line in fd:
 		time+=get_value(line, cache_obj)
 	fd.close()
